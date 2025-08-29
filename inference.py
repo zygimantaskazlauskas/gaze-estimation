@@ -6,12 +6,28 @@ import numpy as np
 
 import torch
 import torch.nn.functional as F
+
+from picamera2 import Picamera2
 from torchvision import transforms
 
 from config import data_config
 from utils.helpers import get_model, draw_bbox_gaze
 
-import uniface
+
+# Use OpenCV Haar Cascade for face detection (compatible with Raspberry Pi)
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+
+# Helper function to detect faces (returns bboxes and dummy keypoints)
+def detect_faces(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+    bboxes = []
+    keypoints = []
+    for (x, y, w, h) in faces:
+        bboxes.append([x, y, x + w, y + h])
+        # Haar does not provide keypoints, so use center as dummy
+        keypoints.append([[x + w // 2, y + h // 2]])
+    return bboxes, keypoints
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format='%(message)s')
@@ -64,7 +80,7 @@ def main(params):
 
     idx_tensor = torch.arange(params.bins, device=device, dtype=torch.float32)
 
-    face_detector = uniface.RetinaFace()  # third-party face detection library
+    # Use Haar Cascade face detector
 
     try:
         gaze_detector = get_model(params.model, params.bins, inference_mode=True)
@@ -77,38 +93,39 @@ def main(params):
     gaze_detector.to(device)
     gaze_detector.eval()
 
-    video_source = params.source
-    if video_source.isdigit() or video_source == '0':
-        cap = cv2.VideoCapture(int(video_source))
-    else:
-        cap = cv2.VideoCapture(video_source)
 
+    # Use Picamera2 for Raspberry Pi Camera Module 3 (new camera stack)
+    picam2 = Picamera2()
+    camera_config = picam2.create_preview_configuration()
+    picam2.configure(camera_config)
+    picam2.start()
+    # Get camera resolution for output video
+    width = camera_config["main"]["size"][0]
+    height = camera_config["main"]["size"][1]
     if params.output:
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        out = cv2.VideoWriter(params.output, fourcc, cap.get(cv2.CAP_PROP_FPS), (width, height))
-
-    if not cap.isOpened():
-        raise IOError("Cannot open webcam")
+        out = cv2.VideoWriter(params.output, fourcc, 30, (width, height))
 
     with torch.no_grad():
         while True:
-            success, frame = cap.read()
-
-            if not success:
+            frame = picam2.capture_array()
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            if frame is None or frame.size == 0:
                 logging.info("Failed to obtain frame or EOF")
                 break
 
-            bboxes, keypoints = face_detector.detect(frame)
+            bboxes, keypoints = detect_faces(frame)
             for bbox, keypoint in zip(bboxes, keypoints):
                 x_min, y_min, x_max, y_max = map(int, bbox[:4])
-
                 image = frame[y_min:y_max, x_min:x_max]
+                if image.size == 0:
+                    continue
                 image = pre_process(image)
                 image = image.to(device)
 
+                # pitch, yaw = torch.zeros((1, 90)), torch.zeros((1, 90)) #gaze_detector(image)
                 pitch, yaw = gaze_detector(image)
+
 
                 pitch_predicted, yaw_predicted = F.softmax(pitch, dim=1), F.softmax(yaw, dim=1)
 
@@ -131,7 +148,7 @@ def main(params):
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
-    cap.release()
+    picam2.close()
     if params.output:
         out.release()
     cv2.destroyAllWindows()
